@@ -1,32 +1,28 @@
 from dotenv import load_dotenv
 import os
 import requests as rq
+import time
 
 load_dotenv()
 
-def dailyPrices(tickers, interval="12years"):
+def dailyPrices(tickers, interval="1day", years=12):
     
-    dailyPrices = []
+    results = []
     
     def unpackResponse(data):
         ticker = data.get("meta", {}).get("symbol", "UNKNOWN")
+        rows = []
         for row in data.get("values", []):
-            trade_date = row.get("datetime")
-            open_val = float(row.get("open", 0))
-            high_val = float(row.get("high", 0))
-            low_val = float(row.get("low", 0))
-            close_val = float(row.get("close", 0))
-            volume_val = int(row.get("volume", 0))
-
-        return {
-            "ticker": ticker,
-            "trade_date": trade_date,
-            "open_val": open_val,
-            "high_val": high_val,
-            "low_val": low_val,
-            "close_val": close_val,
-            "volume_val": volume_val
-        }
+            rows.append({
+                "ticker": ticker,
+                "trade_date": row.get("datetime"),
+                "open_val": float(row.get("open", 0)),
+                "high_val": float(row.get("high", 0)),
+                "low_val": float(row.get("low", 0)),
+                "close_val": float(row.get("close", 0)),
+                "volume_val": int(row.get("volume", 0))
+            })
+        return rows
 
     key = os.getenv("twelvedataKey")
     url = "https://api.twelvedata.com/time_series"
@@ -35,14 +31,15 @@ def dailyPrices(tickers, interval="12years"):
         params = {
             "symbol": ticker,
             "interval": interval,
+            "outputsize": years*252,
             "apikey": key
         }
         response = rq.get(url, params=params)
         data = response.json()
 
         unpacked = unpackResponse(data)
-        dailyPrices.append(unpacked)
+        results.extend(unpacked)
 
-    return dailyPrices
+        time.sleep(8)
 
-
+    return results
