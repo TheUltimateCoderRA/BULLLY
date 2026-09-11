@@ -1,13 +1,85 @@
 import os
 import re
+
 import pandas as pd
 from dotenv import load_dotenv
 from edgar import Company, set_identity
 
 load_dotenv()
 
+# Canonical concept aliases used by edgartools EntityFacts statements.
+# Order matters: first hit wins.
+CONCEPTS = {
+    "revenue": [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "SalesRevenueNet",
+        "Revenues",
+        "RevenueFromContractWithCustomerExcludingAssessedTaxAbstract",
+    ],
+    "cogs": [
+        "CostOfGoodsAndServicesSold",
+        "CostOfRevenue",
+    ],
+    "grossProfit": [
+        "GrossProfit",
+        "GrossProfit_Calculated",
+    ],
+    "operatingIncome": [
+        "OperatingIncomeLoss",
+    ],
+    "netIncome": [
+        "NetIncomeLoss",
+        "ProfitLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+    ],
+    "eps": [
+        "EarningsPerShareDiluted",
+        "EarningsPerShareBasic",
+    ],
+    "shares": [
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "CommonStockSharesOutstanding",
+        "EntityCommonStockSharesOutstanding",
+    ],
+    "totalAssets": [
+        "Assets",
+    ],
+    "totalLiabilities": [
+        "Liabilities",
+    ],
+    "equity": [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
+    "cash": [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsAndShortTermInvestments",
+        "CashAndCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    ],
+    "operatingCashFlow": [
+        "NetCashProvidedByUsedInOperatingActivities",
+    ],
+    "capex": [
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+    ],
+    "debtParts": [
+        "LongTermDebtNoncurrent",
+        "LongTermDebtCurrent",
+        "LongTermDebt",
+        "LongTermDebtAndCapitalLeaseObligations",
+        "LongTermDebtAndCapitalLeaseObligationsCurrent",
+        "CommercialPaper",
+        "ShortTermBorrowings",
+        "NotesPayableCurrent",
+        "LinesOfCreditCurrent",
+        "DebtCurrent",
+    ],
+}
 
-def fundamentals(tickers):
+
+def fundamentals(tickers, periods=8):
     email = os.getenv("userEmail")
     if not email:
         raise ValueError("userEmail not found in environment variables.")
@@ -15,172 +87,178 @@ def fundamentals(tickers):
     set_identity(email)
     results = []
 
-    def periodColumns(df):
-        cols = []
-        for col in df.columns:
-            if re.match(r"^\d{4}-\d{2}-\d{2}", str(col)):
-                cols.append(col)
-        return cols
+    def fyColumns(df):
+        if df is None or df.empty:
+            return []
+        cols = [col for col in df.columns if re.match(r"^FY\s+\d{4}$", str(col))]
+        # Newest fiscal year first.
+        return sorted(cols, key=lambda col: int(str(col).split()[-1]), reverse=True)
 
-    def normalizePeriodKey(periodCol):
-        match = re.match(r"^(\d{4}-\d{2}-\d{2})", str(periodCol))
-        return match.group(1) if match else str(periodCol)
+    def pick(df, fyCol, aliases):
+        if df is None or fyCol is None or fyCol not in getattr(df, "columns", []):
+            return None
 
-    def findPeriodCol(df, periodKey):
-        for col in periodColumns(df):
-            if normalizePeriodKey(col) == periodKey:
-                return col
+        for concept in aliases:
+            if concept not in df.index:
+                continue
+            value = df.loc[concept, fyCol]
+            # Duplicate index rows can return a Series.
+            if isinstance(value, pd.Series):
+                value = value.dropna()
+                if value.empty:
+                    continue
+                value = value.iloc[0]
+            if pd.isna(value):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
         return None
 
-    def lookupValue(df, periodCol, labels):
-        if periodCol is None or periodCol not in df.columns:
-            return 0
-
-        labelSet = {label.lower() for label in labels}
-        for _, row in df.iterrows():
-            if bool(row.get("dimension", False)) or bool(row.get("abstract", False)):
+    def sumParts(df, fyCol, aliases):
+        total = 0.0
+        found = False
+        for concept in aliases:
+            value = pick(df, fyCol, [concept])
+            if value is None:
                 continue
+            total += value
+            found = True
+        return total if found else None
 
-            candidates = [
-                str(row.get("label", "") or "").lower(),
-                str(row.get("standard_concept", "") or "").lower(),
-            ]
-            if not any(candidate in labelSet for candidate in candidates):
-                continue
-
-            value = row.get(periodCol)
-            if pd.isna(value):
-                return 0
-            return value
-        return 0
-
-    def toNumber(value, cast=float):
-        if value is None or (isinstance(value, float) and pd.isna(value)):
-            return cast(0)
+    def toInt(value):
+        if value is None:
+            return None
         try:
-            return cast(value)
+            return int(round(value))
         except (TypeError, ValueError):
-            return cast(0)
+            return None
 
-    def parsePeriod(periodKey, periodCol):
-        year, month, day = periodKey.split("-")
-        reportDate = periodKey
-        fiscalYear = int(year)
-        fiscalQuarter = 4 if "(FY)" in str(periodCol) else ((int(month) - 1) // 3) + 1
-        return reportDate, fiscalYear, fiscalQuarter
+    def reportDates(facts, fyCols):
+        """Map FY columns to period-end dates using balance-sheet instant facts."""
+        mapping = {col: None for col in fyCols}
+        if not fyCols:
+            return mapping
+        try:
+            series = facts.time_series("Assets", periods=max(24, len(fyCols) * 4))
+            ends = []
+            seen = set()
+            for end in sorted(series["period_end"].dropna().unique(), reverse=True):
+                key = str(end)[:10]
+                if key in seen:
+                    continue
+                seen.add(key)
+                ends.append(key)
+            for index, col in enumerate(fyCols):
+                if index < len(ends):
+                    mapping[col] = ends[index]
+        except Exception:
+            pass
+        return mapping
 
-    def unpackResponse(ticker, incomeStatement, balanceSheet, cashFlow):
-        incomeDf = incomeStatement.to_dataframe()
-        balanceDf = balanceSheet.to_dataframe()
-        cashDf = cashFlow.to_dataframe()
+    def unpackFacts(ticker, company, facts):
+        incomeDf = facts.income_statement(periods=periods, as_dataframe=True, annual=True)
+        balanceDf = facts.balance_sheet(periods=periods, as_dataframe=True, annual=True)
+        cashDf = facts.cash_flow_statement(periods=periods, as_dataframe=True, annual=True)
 
-        periodKeys = set()
+        fyCols = []
+        seen = set()
         for df in (incomeDf, balanceDf, cashDf):
-            for col in periodColumns(df):
-                periodKeys.add(normalizePeriodKey(col))
+            for col in fyColumns(df):
+                if col not in seen:
+                    seen.add(col)
+                    fyCols.append(col)
+        fyCols = sorted(fyCols, key=lambda col: int(str(col).split()[-1]), reverse=True)
 
+        dates = reportDates(facts, fyCols)
         records = []
-        for periodKey in sorted(periodKeys, reverse=True):
-            incomeCol = findPeriodCol(incomeDf, periodKey)
-            balanceCol = findPeriodCol(balanceDf, periodKey)
-            cashCol = findPeriodCol(cashDf, periodKey)
-            periodHint = incomeCol or balanceCol or cashCol or periodKey
-            reportDate, fiscalYear, fiscalQuarter = parsePeriod(periodKey, periodHint)
 
-            revenue = toNumber(lookupValue(incomeDf, incomeCol, ["net sales", "total revenue", "revenue"]))
-            grossProfit = toNumber(lookupValue(incomeDf, incomeCol, ["gross margin", "gross profit", "grossprofit"]))
-            operatingIncome = toNumber(lookupValue(incomeDf, incomeCol, ["operating income", "operatingincomeloss"]))
-            netIncome = toNumber(lookupValue(incomeDf, incomeCol, ["net income", "netincome"]))
-            eps = toNumber(lookupValue(incomeDf, incomeCol, [
-                "diluted (in dollars per share)",
-                "earnings per share diluted",
-            ]))
+        for fyCol in fyCols:
+            fiscalYear = int(str(fyCol).split()[-1])
+            reportDate = dates.get(fyCol)
 
-            totalAssets = toNumber(lookupValue(balanceDf, balanceCol, ["total assets", "assets"]))
-            totalLiabilities = toNumber(lookupValue(balanceDf, balanceCol, ["total liabilities", "liabilities"]))
-            cashAndEquivalents = toNumber(lookupValue(balanceDf, balanceCol, [
-                "cash and cash equivalents",
-                "cashandmarketablesecurities",
-            ]))
-            sharesOutstanding = toNumber(lookupValue(balanceDf, balanceCol, [
-                "common stock, shares outstanding (in shares)",
-                "sharesyearend",
-                "sharesissued",
-            ]), cast=int)
+            revenue = pick(incomeDf, fyCol, CONCEPTS["revenue"])
+            cogs = pick(incomeDf, fyCol, CONCEPTS["cogs"])
+            grossProfit = pick(incomeDf, fyCol, CONCEPTS["grossProfit"])
+            if grossProfit is None and revenue is not None and cogs is not None:
+                grossProfit = revenue - cogs
 
-            commercialPaper = toNumber(lookupValue(balanceDf, balanceCol, ["commercial paper", "shorttermdebt"]))
-            currentTermDebt = toNumber(lookupValue(balanceDf, balanceCol, ["currentportionoflongtermdebt"]))
-            longTermDebt = toNumber(lookupValue(balanceDf, balanceCol, ["longtermdebt"]))
-            if currentTermDebt == 0 and longTermDebt == 0:
-                # Fallback when standard_concept is missing and both lines share label "Term debt".
-                termDebtTotal = 0
-                if balanceCol is not None:
-                    for _, row in balanceDf.iterrows():
-                        if bool(row.get("dimension", False)) or bool(row.get("abstract", False)):
-                            continue
-                        if str(row.get("label", "") or "").lower() != "term debt":
-                            continue
-                        value = row.get(balanceCol)
-                        if not pd.isna(value):
-                            termDebtTotal += toNumber(value)
-                totalDebt = commercialPaper + termDebtTotal
+            operatingIncome = pick(incomeDf, fyCol, CONCEPTS["operatingIncome"])
+            netIncome = pick(incomeDf, fyCol, CONCEPTS["netIncome"])
+            eps = pick(incomeDf, fyCol, CONCEPTS["eps"])
+
+            sharesOutstanding = toInt(pick(incomeDf, fyCol, CONCEPTS["shares"]))
+            if sharesOutstanding is None:
+                sharesOutstanding = toInt(pick(balanceDf, fyCol, CONCEPTS["shares"]))
+            if sharesOutstanding is None and fyCol == fyCols[0]:
+                sharesOutstanding = toInt(getattr(facts, "shares_outstanding", None))
+
+            totalAssets = pick(balanceDf, fyCol, CONCEPTS["totalAssets"])
+            totalLiabilities = pick(balanceDf, fyCol, CONCEPTS["totalLiabilities"])
+            equity = pick(balanceDf, fyCol, CONCEPTS["equity"])
+            if totalLiabilities is None and totalAssets is not None and equity is not None:
+                totalLiabilities = totalAssets - equity
+
+            cashAndEquivalents = pick(balanceDf, fyCol, CONCEPTS["cash"])
+            totalDebt = sumParts(balanceDf, fyCol, CONCEPTS["debtParts"])
+
+            operatingCashFlow = pick(cashDf, fyCol, CONCEPTS["operatingCashFlow"])
+            capex = pick(cashDf, fyCol, CONCEPTS["capex"])
+            if operatingCashFlow is None or capex is None:
+                freeCashFlow = None
             else:
-                totalDebt = commercialPaper + currentTermDebt + longTermDebt
-
-            operatingCashFlow = toNumber(lookupValue(cashDf, cashCol, [
-                "cash generated by operating activities",
-                "netcashfromoperatingactivities",
-            ]))
-            capex = toNumber(lookupValue(cashDf, cashCol, [
-                "payments for acquisition of property, plant and equipment",
-                "capitalexpenses",
-            ]))
-            freeCashFlow = operatingCashFlow + capex if capex <= 0 else operatingCashFlow - capex
+                freeCashFlow = operatingCashFlow - abs(capex)
 
             records.append({
                 "ticker": ticker,
-                "reportDate": reportDate,
-                "fiscalYear": fiscalYear,
-                "fiscalQuarter": fiscalQuarter,
+                "report_date": reportDate,
+                "fiscal_year": fiscalYear,
+                "fiscal_quarter": 4,
                 "revenue": revenue,
-                "grossProfit": grossProfit,
-                "operatingIncome": operatingIncome,
-                "netIncome": netIncome,
+                "gross_profit": grossProfit,
+                "operating_income": operatingIncome,
+                "net_income": netIncome,
                 "eps": eps,
-                "totalAssets": totalAssets,
-                "totalLiabilities": totalLiabilities,
-                "totalDebt": totalDebt,
-                "cashAndEquivalents": cashAndEquivalents,
-                "freeCashFlow": freeCashFlow,
-                "sharesOutstanding": sharesOutstanding,
-                "marketCap": 0,
-                "peRatio": 0.0,
-                "pegRatio": 0.0,
-                "priceToSales": 0.0,
-                "priceToBook": 0.0,
-                "revenueGrowth": 0.0,
-                "earningsGrowth": 0.0,
+                "total_assets": totalAssets,
+                "total_liabilities": totalLiabilities,
+                "total_debt": totalDebt,
+                "cash_and_equivalents": cashAndEquivalents,
+                "free_cash_flow": freeCashFlow,
+                "shares_outstanding": sharesOutstanding,
+                "market_cap": None,
+                "pe_ratio": None,
+                "peg_ratio": None,
+                "price_to_sales": None,
+                "price_to_book": None,
+                "revenue_growth": None,
+                "earnings_growth": None,
             })
 
-        # records are newest-first; growth compares each period to the next older one
         for index in range(len(records) - 1):
             current = records[index]
             prior = records[index + 1]
-            if prior["revenue"]:
-                current["revenueGrowth"] = (current["revenue"] - prior["revenue"]) / abs(prior["revenue"])
-            if prior["netIncome"]:
-                current["earningsGrowth"] = (current["netIncome"] - prior["netIncome"]) / abs(prior["netIncome"])
+            if current["revenue"] is not None and prior["revenue"]:
+                current["revenue_growth"] = (
+                    (current["revenue"] - prior["revenue"]) / abs(prior["revenue"])
+                )
+            if current["net_income"] is not None and prior["net_income"]:
+                current["earnings_growth"] = (
+                    (current["net_income"] - prior["net_income"])
+                    / abs(prior["net_income"])
+                )
 
         return records
 
     for ticker in tickers:
-        company = Company(ticker)
-        financials = company.get_financials()
-
-        incomeStatement = financials.income_statement()
-        balanceSheet = financials.balance_sheet()
-        cashFlow = financials.cash_flow_statement()
-
-        results.extend(unpackResponse(ticker, incomeStatement, balanceSheet, cashFlow))
+        try:
+            company = Company(ticker)
+            facts = company.get_facts()
+            if facts is None:
+                continue
+            results.extend(unpackFacts(ticker, company, facts))
+        except Exception:
+            # Keep batch running; caller/tests can detect missing tickers.
+            continue
 
     return results
